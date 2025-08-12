@@ -11,7 +11,7 @@ Available as a standalone executable - no Python installation required. Sometime
 
 
 Make a folder named "UnrealPBRTool" in C drive. Download this Script and save as python unreal_pbr_tool_full.py in the "UnrealPBRTool" folder.
-Install Python and supporting libraries.
+Install Python and dependencies.
 Run this code in Python " cd C:\UnrealPBRTool "
 python unreal_pbr_tool_full.py
 
