@@ -1,0 +1,9 @@
+pip install pillow pyqt5
+pip install pyqt5 pillow numpy opencv-python
+pip install PySide6 Pillow numpy
+pip install openexr  # for EXR support
+python -m pip install --upgrade pip
+pip install PySide6 --timeout 200
+pip install Pillow --timeout 200
+pip install numpy --timeout 200
+pip install openexr --timeout 200
