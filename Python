@@ -1,0 +1,564 @@
+#!/usr/bin/env python3
+"""
+Unreal PBR Texture Tool - Full-featured v1.1 with Individual Map Export
+Requirements: PyQt5, Pillow, numpy
+
+Save as: unreal_pbr_tool_full.py
+Run: python unreal_pbr_tool_full.py
+Package (optional): pyinstaller --onefile --noconsole unreal_pbr_tool_full.py
+"""
+
+import sys, os
+from PIL import Image, ImageOps, ImageFilter
+import numpy as np
+from PyQt5 import QtWidgets, QtGui, QtCore
+
+# ---------------------------
+# Utility image functions
+# ---------------------------
+def pil_to_qpixmap(pil_img, max_size=None):
+    if pil_img is None:
+        return QtGui.QPixmap()
+    img = pil_img.convert("RGBA")
+    if max_size:
+        img = ImageOps.contain(img, max_size)
+    data = img.tobytes("raw", "RGBA")
+    qimg = QtGui.QImage(data, img.width, img.height, QtGui.QImage.Format_RGBA8888)
+    return QtGui.QPixmap.fromImage(qimg)
+
+def load_image_force_rgba(path):
+    try:
+        img = Image.open(path)
+        # preserve if 16-bit? Pillow opens many formats; we convert to 8-bit RGBA for simplicity
+        img = img.convert("RGBA")
+        return img
+    except Exception as e:
+        raise
+
+def resize_for_export(img, size):
+    if img is None:
+        return None
+    return img.resize((size, size), Image.LANCZOS)
+
+def ensure_size_match(img, size):
+    if img is None:
+        return None
+    return ImageOps.fit(img, (size, size), Image.LANCZOS)
+
+def gray_from_image(img, size):
+    if img is None:
+        return Image.new("L", (size, size), 0)
+    g = img.convert("L")
+    if g.size != (size, size):
+        g = g.resize((size, size), Image.LANCZOS)
+    return g
+
+# Simple height->normal (sobel-based) returns RGB normal image
+def height_to_normal(height_img, strength=2.0, size=None):
+    if height_img is None:
+        return None
+    h = height_img.convert("L")
+    if size:
+        h = h.resize((size, size), Image.LANCZOS)
+    arr = np.asarray(h).astype(np.float32) / 255.0
+    # Sobel kernels
+    kx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
+    ky = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32)
+    # pad
+    pad = np.pad(arr, ((1,1),(1,1)), mode='edge')
+    gx = np.zeros_like(arr)
+    gy = np.zeros_like(arr)
+    for y in range(arr.shape[0]):
+        for x in range(arr.shape[1]):
+            region = pad[y:y+3, x:x+3]
+            gx[y,x] = np.sum(region * kx)
+            gy[y,x] = np.sum(region * ky)
+    # build normal
+    nz = 1.0 / strength
+    nx = -gx
+    ny = -gy
+    length = np.sqrt(nx*nx + ny*ny + nz*nz)
+    nx /= length; ny /= length; nz /= length
+    # convert to 0-255
+    rn = ((nx*0.5 + 0.5) * 255).astype(np.uint8)
+    gn = ((ny*0.5 + 0.5) * 255).astype(np.uint8)
+    bn = ((nz*0.5 + 0.5) * 255).astype(np.uint8)
+    rgba = np.dstack([rn, gn, bn, np.full_like(rn, 255)])
+    return Image.fromarray(rgba, mode="RGBA")
+
+# ---------------------------
+# UI Widgets
+# ---------------------------
+class TextureSlot(QtWidgets.QFrame):
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        self.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        self.setAcceptDrops(True)
+        self.img = None
+        self.path = None
+
+        self.layout = QtWidgets.QVBoxLayout(self)
+        self.lbl_title = QtWidgets.QLabel(title)
+        self.lbl_title.setAlignment(QtCore.Qt.AlignCenter)
+        self.preview = QtWidgets.QLabel("Drop or Load")
+        self.preview.setFixedSize(160,160)
+        self.preview.setAlignment(QtCore.Qt.AlignCenter)
+        self.preview.setStyleSheet("background:#222; color:#ddd; border:1px solid #444;")
+        self.btn_load = QtWidgets.QPushButton("Load")
+        self.btn_load.clicked.connect(self.open_file)
+        self.btn_clear = QtWidgets.QPushButton("Clear")
+        self.btn_clear.clicked.connect(self.clear)
+
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.btn_load)
+        row.addWidget(self.btn_clear)
+
+        self.layout.addWidget(self.lbl_title)
+        self.layout.addWidget(self.preview)
+        self.layout.addLayout(row)
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        urls = e.mimeData().urls()
+        if urls:
+            path = urls[0].toLocalFile()
+            self.load(path)
+
+    def open_file(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load image", ".", "Images (*.png *.jpg *.jpeg *.tga *.tif *.exr *.bmp)")
+        if path:
+            self.load(path)
+
+    def load(self, path):
+        try:
+            img = load_image_force_rgba(path)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Error loading", str(e))
+            return
+        self.img = img
+        self.path = path
+        self.update_preview()
+
+    def clear(self):
+        self.img = None
+        self.path = None
+        self.preview.setPixmap(QtGui.QPixmap())
+        self.preview.setText("Drop or Load")
+
+    def update_preview(self):
+        if self.img:
+            pix = pil_to_qpixmap(self.img, max_size=(160,160))
+            self.preview.setPixmap(pix)
+        else:
+            self.preview.setPixmap(QtGui.QPixmap())
+            self.preview.setText("Drop or Load")
+
+
+class PBRTool(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Unreal PBR Texture Tool - Full v1.1")
+        self.resize(1100, 640)
+
+        main = QtWidgets.QVBoxLayout(self)
+
+        # Top: slots
+        slots_layout = QtWidgets.QHBoxLayout()
+        self.slot_base = TextureSlot("Base Color (Albedo)")
+        self.slot_normal = TextureSlot("Normal")
+        self.slot_ao = TextureSlot("Ambient Occlusion (AO)")
+        self.slot_rough = TextureSlot("Roughness")
+        self.slot_met = TextureSlot("Metallic")
+        self.slot_height = TextureSlot("Height / Displacement")
+
+        for s in [self.slot_base, self.slot_normal, self.slot_ao, self.slot_rough, self.slot_met, self.slot_height]:
+            slots_layout.addWidget(s)
+        main.addLayout(slots_layout)
+
+        # Middle: options + preview area
+        mid = QtWidgets.QHBoxLayout()
+
+        opts = QtWidgets.QGroupBox("Export Options")
+        opts_layout = QtWidgets.QFormLayout(opts)
+        self.res_combo = QtWidgets.QComboBox()
+        self.res_combo.addItems(["8192","4096","2048","1024","512","256","128"])
+        self.format_combo = QtWidgets.QComboBox()
+        self.format_combo.addItems(["PNG","TGA"])
+        self.invert_rough = QtWidgets.QCheckBox("Invert Roughness (if you have Gloss)")
+        self.auto_from_base = QtWidgets.QCheckBox("Auto-name exports from Base Color filename")
+        self.auto_from_base.setChecked(True)
+        btn_folder = QtWidgets.QPushButton("Select Output Folder")
+        btn_folder.clicked.connect(self.choose_output_folder)
+        self.output_folder_label = QtWidgets.QLabel("No folder selected")
+        self.btn_export = QtWidgets.QPushButton("Export PBR Maps")
+        self.btn_export.clicked.connect(self.export_pbr)
+        
+        # NEW: Save Individual Maps button
+        self.btn_save_individual = QtWidgets.QPushButton("Save Individual Maps")
+        self.btn_save_individual.clicked.connect(self.save_individual_maps)
+
+        opts_layout.addRow("Resolution:", self.res_combo)
+        opts_layout.addRow("Format:", self.format_combo)
+        opts_layout.addRow(self.invert_rough)
+        opts_layout.addRow(self.auto_from_base)
+        opts_layout.addRow(btn_folder, self.output_folder_label)
+        opts_layout.addRow(self.btn_export)
+        opts_layout.addRow(self.btn_save_individual)  # Add the new button
+
+        mid.addWidget(opts, 0)
+
+        # Preview area
+        preview_box = QtWidgets.QGroupBox("Preview / Generated")
+        pv_layout = QtWidgets.QVBoxLayout(preview_box)
+        self.preview_tabs = QtWidgets.QTabWidget()
+        self.lbl_preview_base = QtWidgets.QLabel("Base Preview")
+        self.lbl_preview_base.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_preview_base.setFixedSize(400,400)
+        self.lbl_preview_base.setStyleSheet("background:#ddd; border:1px solid #999;")
+        self.lbl_preview_orm = QtWidgets.QLabel("ORM Preview")
+        self.lbl_preview_orm.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_preview_orm.setFixedSize(400,400)
+        self.lbl_preview_normal = QtWidgets.QLabel("Normal Preview")
+        self.lbl_preview_normal.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_preview_normal.setFixedSize(400,400)
+        self.preview_tabs.addTab(self.lbl_preview_base, "Base")
+        self.preview_tabs.addTab(self.lbl_preview_normal, "Normal")
+        self.preview_tabs.addTab(self.lbl_preview_orm, "ORM (R=A O; G=Rough; B=Metal)")
+        pv_layout.addWidget(self.preview_tabs)
+        mid.addWidget(preview_box, 1)
+
+        main.addLayout(mid)
+
+        # Bottom: helpers
+        helpers = QtWidgets.QHBoxLayout()
+        self.btn_split_rgb = QtWidgets.QPushButton("Split RGB(A) into slots")
+        self.btn_split_rgb.clicked.connect(self.split_rgb_into_slots)
+        self.btn_height_to_normal = QtWidgets.QPushButton("Height -> Normal (preview & use)")
+        self.btn_height_to_normal.clicked.connect(self.do_height_to_normal_preview)
+        self.btn_reset = QtWidgets.QPushButton("Reset All")
+        self.btn_reset.clicked.connect(self.reset_all)
+        helpers.addWidget(self.btn_split_rgb)
+        helpers.addWidget(self.btn_height_to_normal)
+        helpers.addWidget(self.btn_reset)
+        main.addLayout(helpers)
+
+        # internal
+        self.output_folder = None
+        self.current_generated = {"orm": None, "normal": None}
+        # connect slot preview updates
+        for s in [self.slot_base, self.slot_normal, self.slot_ao, self.slot_rough, self.slot_met, self.slot_height]:
+            # when loaded via button, update preview afterwards
+            s.btn_load.clicked.connect(self.update_previews)
+            s.btn_clear.clicked.connect(self.update_previews)
+
+    # ---------------------------
+    # Actions
+    # ---------------------------
+    def choose_output_folder(self):
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select output folder", ".")
+        if folder:
+            self.output_folder = folder
+            self.output_folder_label.setText(folder)
+
+    def reset_all(self):
+        for s in [self.slot_base, self.slot_normal, self.slot_ao, self.slot_rough, self.slot_met, self.slot_height]:
+            s.clear()
+        self.current_generated = {"orm": None, "normal": None}
+        self.update_previews()
+
+    def split_rgb_into_slots(self):
+        # allows the user to load an RGB image and auto-fill base/ao/rough/metal etc
+        # For simplicity: if you load an RGB image it will fill Base Color; Use "Load RGB and Split" workflow isn't heavy here.
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load RGB(A) image to split into channels", ".", "Images (*.png *.jpg *.tga *.tif *.exr *.bmp)")
+        if not path:
+            return
+        img = load_image_force_rgba(path)
+        
+        # Parse the filename to create appropriate names for split channels
+        filename = os.path.basename(path)
+        name_without_ext = os.path.splitext(filename)[0]
+        
+        # Create base filename by removing common suffixes and adding map-specific ones
+        base_name = self.parse_texture_name(name_without_ext)
+        
+        # fill base color slot
+        self.slot_base.img = img
+        self.slot_base.path = path
+        
+        # as a helpful convenience, also split channels into AO/Rough/Metal if user wants; we keep them in separate slots as grayscale images.
+        r,g,b,a = img.split()
+        self.slot_ao.img = Image.merge("RGBA",(r,r,r,Image.new("L", r.size,255))).convert("RGBA")
+        self.slot_rough.img = Image.merge("RGBA",(g,g,g,Image.new("L", g.size,255))).convert("RGBA")
+        self.slot_met.img = Image.merge("RGBA",(b,b,b,Image.new("L", b.size,255))).convert("RGBA")
+        
+        # Set synthetic paths for the split channels to enable proper naming
+        self.slot_ao.path = f"{base_name}_ao"
+        self.slot_rough.path = f"{base_name}_rough"
+        self.slot_met.path = f"{base_name}_metal"
+        
+        for s in [self.slot_base, self.slot_ao, self.slot_rough, self.slot_met]:
+            s.update_preview()
+        self.update_previews()
+    
+    def parse_texture_name(self, filename):
+        """
+        Parse texture filename and return base name for split channels
+        Examples:
+        'rusty_metal_04_diff_1k_ORM' -> 'rusty_metal_04_1k'
+        'brick_wall_2k_ORM' -> 'brick_wall_2k'
+        'wood_planks_4k_packed' -> 'wood_planks_4k'
+        """
+        # Convert to lowercase for pattern matching
+        lower_name = filename.lower()
+        
+        # Common suffixes to remove (in order of specificity)
+        suffixes_to_remove = [
+            '_orm', '_packed', '_combined', '_comp',
+            '_diff', '_diffuse', '_albedo', '_base', '_basecolor',
+            '_ao', '_occlusion', '_ambient',
+            '_rough', '_roughness', '_gloss',
+            '_metal', '_metallic', '_metalness',
+            '_normal', '_norm', '_n',
+            '_height', '_disp', '_displacement'
+        ]
+        
+        # Remove the most specific suffix found
+        result = filename
+        for suffix in suffixes_to_remove:
+            if lower_name.endswith(suffix):
+                # Remove the suffix (case-insensitive)
+                result = filename[:-len(suffix)]
+                break
+        
+        return result
+
+    def save_individual_maps(self):
+        """Save individual AO, Roughness, and Metallic maps as separate files"""
+        if not self.output_folder:
+            QtWidgets.QMessageBox.information(self, "Select output folder", "Please choose an output folder first.")
+            return
+        
+        size = int(self.res_combo.currentText())
+        fmt = self.format_combo.currentText().upper()
+        saved_files = []
+        
+        # Save AO map
+        if self.slot_ao.img:
+            try:
+                ao_img = resize_for_export(self.slot_ao.img, size)
+                # Use AO slot's own filename if available, otherwise use generic name
+                if self.slot_ao.path:
+                    if self.slot_ao.path.endswith('_ao'):
+                        # This is from a split operation, use the synthetic name
+                        ao_basename = self.slot_ao.path
+                    else:
+                        # This is from a loaded file, use its basename
+                        ao_basename = os.path.splitext(os.path.basename(self.slot_ao.path))[0]
+                else:
+                    ao_basename = "AO_Map"
+                fn_ao = os.path.join(self.output_folder, f"{ao_basename}.{fmt.lower()}")
+                if fmt == "TGA":
+                    ao_img = ao_img.convert("RGBA")
+                ao_img.save(fn_ao)
+                saved_files.append(fn_ao)
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Save error", f"Failed to save AO map: {e}")
+                return
+        
+        # Save Roughness map
+        if self.slot_rough.img:
+            try:
+                rough_img = resize_for_export(self.slot_rough.img, size)
+                # Apply inversion if checkbox is checked
+                if self.invert_rough.isChecked():
+                    rough_gray = rough_img.convert("L")
+                    rough_gray = ImageOps.invert(rough_gray)
+                    rough_img = Image.merge("RGBA", (rough_gray, rough_gray, rough_gray, Image.new("L", rough_gray.size, 255)))
+                
+                # Use Roughness slot's own filename if available, otherwise use generic name
+                if self.slot_rough.path:
+                    if self.slot_rough.path.endswith('_rough'):
+                        # This is from a split operation, use the synthetic name
+                        rough_basename = self.slot_rough.path
+                    else:
+                        # This is from a loaded file, use its basename
+                        rough_basename = os.path.splitext(os.path.basename(self.slot_rough.path))[0]
+                else:
+                    rough_basename = "Roughness_Map"
+                fn_rough = os.path.join(self.output_folder, f"{rough_basename}.{fmt.lower()}")
+                if fmt == "TGA":
+                    rough_img = rough_img.convert("RGBA")
+                rough_img.save(fn_rough)
+                saved_files.append(fn_rough)
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Save error", f"Failed to save Roughness map: {e}")
+                return
+        
+        # Save Metallic map
+        if self.slot_met.img:
+            try:
+                met_img = resize_for_export(self.slot_met.img, size)
+                # Use Metallic slot's own filename if available, otherwise use generic name
+                if self.slot_met.path:
+                    if self.slot_met.path.endswith('_metal'):
+                        # This is from a split operation, use the synthetic name
+                        met_basename = self.slot_met.path
+                    else:
+                        # This is from a loaded file, use its basename
+                        met_basename = os.path.splitext(os.path.basename(self.slot_met.path))[0]
+                else:
+                    met_basename = "Metallic_Map"
+                fn_met = os.path.join(self.output_folder, f"{met_basename}.{fmt.lower()}")
+                if fmt == "TGA":
+                    met_img = met_img.convert("RGBA")
+                met_img.save(fn_met)
+                saved_files.append(fn_met)
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Save error", f"Failed to save Metallic map: {e}")
+                return
+        
+        if saved_files:
+            file_list = "\n".join([os.path.basename(f) for f in saved_files])
+            QtWidgets.QMessageBox.information(self, "Individual maps saved", f"Saved individual maps:\n{file_list}")
+        else:
+            QtWidgets.QMessageBox.information(self, "No maps to save", "No AO, Roughness, or Metallic maps found in slots.")
+
+    def do_height_to_normal_preview(self):
+        if self.slot_height.img is None:
+            QtWidgets.QMessageBox.information(self, "No height map", "Please load a height map first.")
+            return
+        size = int(self.res_combo.currentText())
+        normal = height_to_normal(self.slot_height.img, strength=2.0, size=size)
+        if normal:
+            self.current_generated["normal"] = normal
+            # update preview tab if chosen
+            pix = pil_to_qpixmap(normal, max_size=(400,400))
+            self.lbl_preview_normal.setPixmap(pix)
+            # Also set the Normal slot to this generated normal (so it will be exported as Normal unless user changes)
+            self.slot_normal.img = normal
+            self.slot_normal.update_preview()
+            QtWidgets.QMessageBox.information(self, "Done", "Generated normal from height and placed it in Normal slot (preview updated).")
+
+    def build_orm(self, size):
+        # ORM layout: R = AO, G = Roughness, B = Metallic
+        ao = gray_from_image(self.slot_ao.img, size)
+        rough = gray_from_image(self.slot_rough.img, size)
+        metal = gray_from_image(self.slot_met.img, size)
+        if self.invert_rough.isChecked():
+            # roughness inversion: invert grayscale
+            rough = ImageOps.invert(rough)
+        orm = Image.merge("RGB", (ao, rough, metal))
+        return orm
+
+    def update_previews(self):
+        # Base preview
+        if self.slot_base.img:
+            pix = pil_to_qpixmap(self.slot_base.img, max_size=(400,400))
+            self.lbl_preview_base.setPixmap(pix)
+        else:
+            self.lbl_preview_base.setPixmap(QtGui.QPixmap())
+            self.lbl_preview_base.setText("Base Preview")
+        # ORM preview (generate at preview resolution small)
+        try:
+            size = 512
+            orm = self.build_orm(size)
+            if orm:
+                self.current_generated["orm"] = orm
+                pix = pil_to_qpixmap(orm, max_size=(400,400))
+                self.lbl_preview_orm.setPixmap(pix)
+        except Exception:
+            pass
+        # Normal preview
+        if self.slot_normal.img:
+            pix = pil_to_qpixmap(self.slot_normal.img, max_size=(400,400))
+            self.lbl_preview_normal.setPixmap(pix)
+        else:
+            if self.current_generated.get("normal"):
+                pix = pil_to_qpixmap(self.current_generated["normal"], max_size=(400,400))
+                self.lbl_preview_normal.setPixmap(pix)
+            else:
+                self.lbl_preview_normal.setPixmap(QtGui.QPixmap())
+                self.lbl_preview_normal.setText("Normal Preview")
+
+    def export_pbr(self):
+        # validate output folder
+        if not self.output_folder:
+            QtWidgets.QMessageBox.information(self, "Select output folder", "Please choose an output folder first.")
+            return
+        size = int(self.res_combo.currentText())
+        fmt = self.format_combo.currentText().upper()
+        basename = "MyTexture"
+        if self.auto_from_base.isChecked() and self.slot_base.path:
+            basename = os.path.splitext(os.path.basename(self.slot_base.path))[0]
+        # Build filenames
+        fn_base = os.path.join(self.output_folder, f"{basename}_BaseColor.{fmt.lower()}")
+        fn_normal = os.path.join(self.output_folder, f"{basename}_Normal.{fmt.lower()}")
+        fn_orm = os.path.join(self.output_folder, f"{basename}_ORM.{fmt.lower()}")
+
+        # Export Base Color
+        try:
+            if self.slot_base.img:
+                bc = resize_for_export(self.slot_base.img, size)
+                if fmt == "TGA":
+                    # TGA prefers 32bit for Unreal; ensure RGBA
+                    bc = bc.convert("RGBA")
+                bc.save(fn_base)
+            else:
+                QtWidgets.QMessageBox.warning(self, "Missing Base", "No Base Color loaded — skipping base export.")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Save error", f"Failed to save base color: {e}")
+            return
+
+        # Export Normal (if not present but Height exists, convert)
+        try:
+            if self.slot_normal.img:
+                normal = resize_for_export(self.slot_normal.img, size)
+            elif self.slot_height.img:
+                normal = height_to_normal(self.slot_height.img, strength=2.0, size=size)
+            else:
+                normal = None
+            if normal:
+                if fmt == "TGA":
+                    normal = normal.convert("RGBA")
+                normal.save(fn_normal)
+            else:
+                QtWidgets.QMessageBox.information(self, "Normal missing", "No Normal or Height map present — skipping Normal export.")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Save error", f"Failed to save normal: {e}")
+            return
+
+        # Export ORM
+        try:
+            orm = self.build_orm(size)
+            if orm:
+                if fmt == "TGA":
+                    orm.save(fn_orm)
+                else:
+                    orm.save(fn_orm)
+            else:
+                QtWidgets.QMessageBox.information(self, "ORM missing", "No AO/Roughness/Metallic provided — skipping ORM export.")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Save error", f"Failed to save ORM: {e}")
+            return
+
+        QtWidgets.QMessageBox.information(self, "Export complete", f"Exported:\n{fn_base}\n{fn_normal}\n{fn_orm}")
+
+        # update previews with full resolution versions
+        self.update_previews()
+
+# ---------------------------
+# Main
+# ---------------------------
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    win = PBRTool()
+    win.show()
+    # initial preview update timer in case loads are done via drop after launch
+    QtCore.QTimer.singleShot(250, win.update_previews)
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()
